@@ -1,0 +1,12 @@
+flask
+flask-socketio
+flask-cors
+python-dotenv
+anthropic
+aiohttp
+python-weather
+googlemaps
+googlesearch-python
+beautifulsoup4
+lxml
+websockets
