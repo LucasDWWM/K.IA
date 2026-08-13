@@ -1,6 +1,6 @@
 """
 K.IA - Konect Intelligence Artefact
-Compatible Anthropic API (claude-sonnet-4-6) ET OpenRouter (modeles gratuits).
+Compatible Anthropic API ET OpenRouter (modeles gratuits).
 
 Dans le .env, configure selon ton fournisseur :
 
@@ -14,9 +14,13 @@ Dans le .env, configure selon ton fournisseur :
   OPENROUTER_MODEL=meta-llama/llama-3.3-8b-instruct:free
 """
 
-import os
+import asyncio
+import base64
 import json
+import os
+import re
 import traceback
+
 import aiohttp
 from dotenv import load_dotenv
 
@@ -24,53 +28,75 @@ load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
 
 PROVIDER           = os.getenv("PROVIDER", "anthropic").lower()
 ANTHROPIC_API_KEY  = os.getenv("ANTHROPIC_API_KEY", "")
+ANTHROPIC_MODEL    = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+MEMORY_MODEL       = os.getenv("MEMORY_MODEL", "claude-opus-5")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_MODEL   = os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.3-8b-instruct:free")
 MAPS_API_KEY       = os.getenv("MAPS_API_KEY", "")
 
+MEMORY_TURNS = int(os.getenv("MEMORY_TURNS", "10"))
+
 SYSTEM_PROMPT = """Tu es K.IA (Konect Intelligence Artefact), un assistant vocal personnel
 francophone, amical et concis. Tes reponses seront lues a voix haute :
 - Reponds en francais naturel, en phrases courtes.
-- Pas de markdown ni de listes sauf si demande explicitement."""
+- Pas de markdown ni de listes sauf si demande explicitement.
+- Si un bloc [MEMOIRE] est fourni, sers-t'en naturellement sans jamais le citer
+  ni mentionner que tu disposes d'une memoire."""
+
+# Fin de phrase : on decoupe ici pour envoyer le texte au TTS au fil de l'eau.
+_SENTENCE_BOUNDARY = re.compile(r"[.!?…](?=[\s\"')\]]|$)|\n")
+_MIN_TTS_CHARS = 15
 
 
 # ---------------------------------------------------------------------------
 # Couche d'abstraction LLM : Anthropic ou OpenRouter
 # ---------------------------------------------------------------------------
 
-async def _call_anthropic_stream(messages: list, socketio, tools: list):
+def _flatten(messages: list) -> list:
+    """Convertit les messages format Anthropic en messages texte simple."""
+    return [
+        {
+            "role": m["role"],
+            "content": (
+                m["content"]
+                if isinstance(m["content"], str)
+                else next((b["text"] for b in m["content"] if b.get("type") == "text"), "")
+            ),
+        }
+        for m in messages
+    ]
+
+
+async def _call_anthropic_stream(messages: list, system: str, on_chunk, tools: list):
     from anthropic import AsyncAnthropic
     client = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
     full_text = ""
     tool_calls = []
-    stop_reason = "end_turn"
 
     async with client.messages.stream(
-        model="claude-sonnet-4-6",
+        model=ANTHROPIC_MODEL,
         max_tokens=1024,
-        system=SYSTEM_PROMPT,
+        system=system,
         tools=tools,
         messages=messages,
     ) as stream:
         async for event in stream:
-            if hasattr(event, "type") and event.type == "content_block_delta":
+            if getattr(event, "type", None) == "content_block_delta":
                 if hasattr(event.delta, "text"):
                     chunk = event.delta.text
-                    socketio.emit("receive_text_chunk", {"text": chunk})
-                    print(chunk, end="", flush=True)
                     full_text += chunk
+                    await on_chunk(chunk)
         final = await stream.get_final_message()
 
     for block in final.content:
         if block.type == "tool_use":
             tool_calls.append({"id": block.id, "name": block.name, "input": block.input})
-    stop_reason = final.stop_reason
 
     print()
-    return full_text, tool_calls, stop_reason
+    return full_text, tool_calls, final.stop_reason
 
 
-async def _call_openrouter_stream(messages: list, socketio):
+async def _call_openrouter_stream(messages: list, system: str, on_chunk):
     """Appel OpenRouter (API compatible OpenAI, streaming SSE). Sans outils pour simplifier."""
     url = "https://openrouter.ai/api/v1/chat/completions"
     headers = {
@@ -82,13 +108,7 @@ async def _call_openrouter_stream(messages: list, socketio):
     payload = {
         "model": OPENROUTER_MODEL,
         "stream": True,
-        "messages": [{"role": "system", "content": SYSTEM_PROMPT}] + [
-            {"role": m["role"], "content": (
-                m["content"] if isinstance(m["content"], str)
-                else next((b["text"] for b in m["content"] if b["type"] == "text"), "")
-            )}
-            for m in messages
-        ],
+        "messages": [{"role": "system", "content": system}] + _flatten(messages),
     }
 
     full_text = ""
@@ -107,15 +127,54 @@ async def _call_openrouter_stream(messages: list, socketio):
                 try:
                     obj = json.loads(data)
                     chunk = obj["choices"][0]["delta"].get("content", "")
-                    if chunk:
-                        socketio.emit("receive_text_chunk", {"text": chunk})
-                        print(chunk, end="", flush=True)
-                        full_text += chunk
                 except Exception:
-                    pass
+                    continue
+                if chunk:
+                    full_text += chunk
+                    await on_chunk(chunk)
 
     print()
     return full_text, [], "end_turn"  # OpenRouter : pas d'outils pour l'instant
+
+
+async def _complete_anthropic(system: str, user: str, max_tokens: int) -> str:
+    """Appel non streame (utilise par la consolidation memoire)."""
+    from anthropic import AsyncAnthropic
+    client = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+    response = await client.messages.create(
+        model=MEMORY_MODEL,
+        max_tokens=max_tokens,
+        system=system,
+        messages=[{"role": "user", "content": user}],
+    )
+    if response.stop_reason == "refusal":
+        raise Exception("Reponse refusee par le modele")
+    return "".join(b.text for b in response.content if b.type == "text")
+
+
+async def _complete_openrouter(system: str, user: str, max_tokens: int) -> str:
+    url = "https://openrouter.ai/api/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://kia-assistant.local",
+        "X-Title": "K.IA",
+    }
+    payload = {
+        "model": OPENROUTER_MODEL,
+        "max_tokens": max_tokens,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+    }
+    timeout = aiohttp.ClientTimeout(total=120)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(url, headers=headers, json=payload) as resp:
+            if resp.status != 200:
+                raise Exception(f"OpenRouter {resp.status}: {await resp.text()}")
+            obj = await resp.json()
+    return obj["choices"][0]["message"]["content"]
 
 
 # ---------------------------------------------------------------------------
@@ -145,15 +204,26 @@ TOOLS = [
 
 
 class KIA:
-    def __init__(self, socketio):
+    def __init__(self, socketio, memory_manager=None, tts_engine=None):
         self.socketio = socketio
+        self.memory_manager = memory_manager
+        self.tts_engine = tts_engine
         self.messages = []
         self.latest_frame = None
+        # Une seule reponse a la fois : protege l'historique et le pipeline TTS.
+        self._lock = asyncio.Lock()
+
+        # Pipeline TTS (une file ordonnee par reponse)
+        self._tts_queue = None
+        self._tts_worker = None
+        self._tts_buffer = ""
+        self._tts_seq = 0
+
         print(f"[K.IA] Fournisseur : {PROVIDER.upper()}")
         if PROVIDER == "openrouter":
             print(f"[K.IA] Modele : {OPENROUTER_MODEL}")
         else:
-            print("[K.IA] Modele : claude-sonnet-4-6")
+            print(f"[K.IA] Modele : {ANTHROPIC_MODEL} | memoire : {MEMORY_MODEL}")
 
     def set_video_frame(self, data_url: str):
         try:
@@ -161,7 +231,30 @@ class KIA:
         except (IndexError, AttributeError):
             self.latest_frame = None
 
+    # ------------------------------------------------------------------
+    # Acces LLM non streame (consomme par MemoryManager)
+    # ------------------------------------------------------------------
+
+    async def complete(self, system: str, user: str, max_tokens: int = 4096) -> str:
+        if PROVIDER == "openrouter":
+            return await _complete_openrouter(system, user, max_tokens)
+        return await _complete_anthropic(system, user, max_tokens)
+
+    # ------------------------------------------------------------------
+    # Boucle principale
+    # ------------------------------------------------------------------
+
+    def _build_system_prompt(self) -> str:
+        if not self.memory_manager:
+            return SYSTEM_PROMPT
+        context = self.memory_manager.load_context(n_last=MEMORY_TURNS)
+        return f"{SYSTEM_PROMPT}\n\n{context}" if context else SYSTEM_PROMPT
+
     async def process_input(self, user_text: str, use_camera: bool = False):
+        async with self._lock:
+            await self._process_input(user_text, use_camera)
+
+    async def _process_input(self, user_text: str, use_camera: bool = False):
         try:
             content = []
             if use_camera and self.latest_frame and PROVIDER == "anthropic":
@@ -172,26 +265,48 @@ class KIA:
             content.append({"type": "text", "text": user_text})
             self.messages.append({"role": "user", "content": content})
 
+            if self.memory_manager:
+                self.memory_manager.save_turn("user", user_text)
+
             self.socketio.emit("status", {"message": "thinking"})
-            await self._run_agent_loop()
+            self._tts_begin()
+            reply = await self._run_agent_loop()
+            await self._tts_end()
+
+            if self.memory_manager and reply:
+                self.memory_manager.save_turn("assistant", reply)
+                self.socketio.emit("memory_stats", self.memory_manager.stats())
+
             self.socketio.emit("status", {"message": "idle"})
 
         except Exception as e:
             print(f"[K.IA][ERREUR] {e}")
             traceback.print_exc()
+            await self._tts_end()
             self.socketio.emit("status", {"message": "error"})
             self.socketio.emit("receive_text_chunk", {"text": f"[Erreur K.IA : {e}]"})
 
-    async def _run_agent_loop(self):
+    async def _on_text_chunk(self, chunk: str):
+        """Emis pour chaque fragment de texte : UI + alimentation du TTS."""
+        self.socketio.emit("receive_text_chunk", {"text": chunk})
+        print(chunk, end="", flush=True)
+        self._tts_feed(chunk)
+
+    async def _run_agent_loop(self) -> str:
+        system = self._build_system_prompt()
+        reply = ""
+
         while True:
             if PROVIDER == "openrouter":
                 full_text, tool_calls, stop_reason = await _call_openrouter_stream(
-                    self.messages, self.socketio
+                    self.messages, system, self._on_text_chunk
                 )
             else:
                 full_text, tool_calls, stop_reason = await _call_anthropic_stream(
-                    self.messages, self.socketio, TOOLS
+                    self.messages, system, self._on_text_chunk, TOOLS
                 )
+
+            reply += full_text
 
             assistant_content = [{"type": "text", "text": full_text}]
             for tc in tool_calls:
@@ -211,6 +326,114 @@ class KIA:
                     "content": json.dumps(result, ensure_ascii=False),
                 })
             self.messages.append({"role": "user", "content": tool_results})
+
+        return reply
+
+    # ------------------------------------------------------------------
+    # Pipeline TTS : synthese en parallele, emission dans l'ordre
+    # ------------------------------------------------------------------
+
+    def _tts_active(self) -> bool:
+        return bool(self.tts_engine and self.tts_engine.enabled)
+
+    def _tts_begin(self):
+        self._tts_buffer = ""
+        self._tts_seq = 0
+        if not self._tts_active():
+            return
+        self._tts_queue = asyncio.Queue()
+        self._tts_worker = asyncio.create_task(self._tts_drain())
+
+    def _tts_feed(self, chunk: str):
+        """Accumule le texte et libere les phrases completes vers le TTS."""
+        if not self._tts_active():
+            return
+        self._tts_buffer += chunk
+        matches = list(_SENTENCE_BOUNDARY.finditer(self._tts_buffer))
+        if not matches:
+            return
+        end = matches[-1].end()
+        ready, rest = self._tts_buffer[:end], self._tts_buffer[end:]
+        if len(ready.strip()) < _MIN_TTS_CHARS:
+            return
+        self._tts_buffer = rest
+        self._tts_enqueue(ready)
+
+    def _tts_enqueue(self, text: str):
+        for piece in self.tts_engine.chunk_text(text, max_chars=150):
+            self._tts_seq += 1
+            # La tache demarre tout de suite : les phrases se synthetisent en
+            # parallele, mais le worker les emet dans l'ordre de la file.
+            task = asyncio.create_task(self.tts_engine.synthesize(piece))
+            self._tts_queue.put_nowait((self._tts_seq, piece, task))
+
+    async def _tts_drain(self):
+        first = True
+        while True:
+            item = await self._tts_queue.get()
+            if item is None:
+                break
+            seq, piece, task = item
+            try:
+                audio = await task
+            except Exception as e:
+                print(f"[TTS][WARN] Synthese echouee : {e}")
+                audio = None
+            if not audio:
+                continue
+            if first:
+                self.socketio.emit("tts_status", {"speaking": True})
+                first = False
+            self.socketio.emit("audio_chunk", {
+                "seq": seq,
+                "text": piece,
+                "mime": self.tts_engine.mime_type,
+                "audio": base64.b64encode(audio).decode("ascii"),
+            })
+        if not first:
+            self.socketio.emit("tts_status", {"speaking": False})
+
+    async def _tts_end(self):
+        if not self._tts_active() or self._tts_queue is None:
+            self._tts_buffer = ""
+            return
+        rest = self._tts_buffer.strip()
+        self._tts_buffer = ""
+        if rest:
+            self._tts_enqueue(rest)
+        self._tts_queue.put_nowait(None)
+        try:
+            await self._tts_worker
+        except Exception as e:
+            print(f"[TTS][WARN] Pipeline interrompu : {e}")
+        finally:
+            self._tts_queue = None
+            self._tts_worker = None
+
+    # ------------------------------------------------------------------
+    # Fin de session
+    # ------------------------------------------------------------------
+
+    async def end_session(self) -> dict:
+        """Consolide la memoire, vide l'historique et ouvre une nouvelle session."""
+        if not self.memory_manager:
+            return {"ok": False, "reason": "memoire desactivee"}
+
+        self.socketio.emit("status", {"message": "thinking"})
+        async with self._lock:
+            report = await self.memory_manager.consolidate(self)
+            if report.get("ok"):
+                self.memory_manager.start_new_session()
+                self.messages = []
+        report["session_id"] = self.memory_manager.get_session_id()
+        self.socketio.emit("session_ended", report)
+        self.socketio.emit("memory_stats", self.memory_manager.stats())
+        self.socketio.emit("status", {"message": "idle"})
+        return report
+
+    # ------------------------------------------------------------------
+    # Outils
+    # ------------------------------------------------------------------
 
     async def _execute_tool(self, name: str, args: dict):
         try:

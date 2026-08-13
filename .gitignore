@@ -4,6 +4,10 @@
 .env.*.local
 backend/.env
 
+# --- Memoire K.IA (donnees personnelles) ---
+backend/memory_store/
+memory_store/
+
 # --- Python (backend) ---
 __pycache__/
 *.py[cod]
